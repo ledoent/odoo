@@ -201,6 +201,34 @@ class AccountAccount(models.Model):
         return [mapped.get(account_type, []) for account_type in account_types]
 
     @api.model
+    def get_account_group_for_company(self, args_list):
+        """Like get_account_group but accepts a company_id parameter.
+
+        Used by ODOO.ACCOUNT.GROUP(type, company_id) to resolve account
+        codes for a specific company in multi-company spreadsheets.
+
+        The input list looks like this::
+
+            [{"account_type": "income", "company_id": 2}, ...]
+        """
+        results = []
+        for args in args_list:
+            account_type = args["account_type"]
+            company_id = args.get("company_id") or self.env.company.id
+            company = self.env["res.company"].browse(company_id)
+            data = self.with_company(company)._read_group(
+                [
+                    *self._check_company_domain(company),
+                    ("account_type", "in", [account_type]),
+                ],
+                ['account_type'],
+                ['code:array_agg'],
+            )
+            mapped = dict(data)
+            results.append(mapped.get(account_type, []))
+        return results
+
+    @api.model
     def spreadsheet_fetch_balance_tag(self, args_list):
         """Fetch data for ODOO.BALANCE.TAG formulas
         The input list looks like this::
