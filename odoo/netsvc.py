@@ -195,6 +195,9 @@ def init_logger():
     warnings.simplefilter('default', category=DeprecationWarning)
     # https://github.com/urllib3/urllib3/issues/2680
     warnings.filterwarnings('ignore', r'^\'urllib3.contrib.pyopenssl\' module is deprecated.+', category=DeprecationWarning)
+    # Python 3.12+: the prefork master forks while server-wide modules may already
+    # own threads; the warning is real but not actionable from Odoo
+    warnings.filterwarnings('ignore', r'^This process \(pid=\d+\) is multi-threaded, use of fork\(\) may lead to deadlocks', category=DeprecationWarning)
     # ignore a bunch of warnings we can't really fix ourselves
     for module in [
         'babel.util', # deprecated parser module, no release yet
