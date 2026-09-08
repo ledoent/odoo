@@ -320,7 +320,9 @@ class Manifest(Mapping[str, typing.Any]):
         modules: dict[str, Manifest] = {}
         for adp in odoo.addons.__path__:
             if not os.path.isdir(adp):
-                _logger.warning("addons path is not a directory: %s", adp)
+                # setuptools' PEP 660 namespace placeholder, not a real path
+                if not adp.endswith('.__path_hook__'):
+                    _logger.warning("addons path is not a directory: %s", adp)
                 continue
             for file_name in os.listdir(adp):
                 if file_name in modules:
