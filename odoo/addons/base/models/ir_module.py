@@ -622,7 +622,7 @@ class IrModuleModule(models.Model):
         try:
             # raise error if database is updating for module operations
             # acquire the shared-lock for the current transaction only
-            self.env.cr.execute("SELECT pg_advisory_xact_lock_shared(hashtext('registry_loading')) NOWAIT")
+            self.env.cr.execute("SELECT pg_advisory_xact_lock_shared(hashtext('registry_loading'))")
             # raise error if another transaction is trying to schedule module operations concurrently
             self.env.cr.execute("LOCK ir_module_module IN EXCLUSIVE MODE")
         except psycopg2.OperationalError:
