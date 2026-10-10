@@ -18,6 +18,7 @@ import {
 } from "../../web_test_helpers";
 
 import { WebClient } from "@web/webclient/webclient";
+import { FormController } from "@web/views/form/form_controller";
 
 onRpc("has_group", () => true);
 
@@ -1341,4 +1342,40 @@ test(`doesn't autosave while a x2many list row is being edited (visibility chang
 
     await hideTab();
     expect.verifySteps(["web_save"]);
+});
+
+// `beforeVisibilityChange` is registered on the document, so it also runs for a
+// controller whose record is gone; mountView always has one, hence the stub.
+function withVisibilityState(value, fn) {
+    const prop = Object.getOwnPropertyDescriptor(Document.prototype, "visibilityState");
+    Object.defineProperty(document, "visibilityState", {
+        value,
+        configurable: true,
+        writable: true,
+    });
+    return Promise.resolve(fn()).finally(() => {
+        Object.defineProperty(document, "visibilityState", prop);
+    });
+}
+
+test("beforeVisibilityChange does not touch the model when the tab becomes visible", async () => {
+    const controller = Object.create(FormController.prototype);
+    controller.formInDialog = 0;
+    Object.defineProperty(controller, "model", {
+        get() {
+            expect.step("model accessed");
+            return { root: undefined };
+        },
+    });
+    await withVisibilityState("visible", () => controller.beforeVisibilityChange());
+    expect.verifySteps([]);
+});
+
+test("beforeVisibilityChange does not crash when the record is gone", async () => {
+    const controller = Object.create(FormController.prototype);
+    controller.formInDialog = 0;
+    controller.model = { root: undefined };
+    controller.disableSaveOnVisibilityChange = false;
+    await withVisibilityState("hidden", () => controller.beforeVisibilityChange());
+    expect(controller.disableSaveOnVisibilityChange).toBe(false);
 });
