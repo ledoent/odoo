@@ -548,7 +548,15 @@ export class FormController extends Component {
     }
 
     async beforeVisibilityChange() {
+        // registered on the document, so it also runs on becoming visible
+        if (document.visibilityState !== "hidden" || this.formInDialog !== 0) {
+            return;
+        }
         const root = this.model.root;
+        if (!root) {
+            // the record may already have been discarded
+            return;
+        }
         const isEditingX2Many = Object.keys(root.activeFields).some((fieldName) => {
             const field = root.fields[fieldName];
             return (
@@ -557,7 +565,7 @@ export class FormController extends Component {
                 root.data[fieldName].editedRecord
             );
         });
-        if (document.visibilityState === "hidden" && this.formInDialog === 0 && !isEditingX2Many) {
+        if (!isEditingX2Many) {
             // calling isDirty forces all fields to commit their changes
             const isDirty = await this.model.root.isDirty();
             if (isDirty && !this.disableSaveOnVisibilityChange) {
