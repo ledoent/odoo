@@ -39,12 +39,30 @@ class PatchImportHook:
             spec = finder.find_spec(fullname, path, target)
             if spec is not None:
                 # we found a spec, change the loader
+                loader = spec.loader
 
-                def exec_module(module: ModuleType, exec_module=spec.loader.exec_module) -> None:
+                def exec_module(module: ModuleType, exec_module=loader.exec_module) -> None:
                     exec_module(module)
                     patch_module(module.__name__)
 
-                spec.loader = SimpleNamespace(create_module=spec.loader.create_module, exec_module=exec_module)
+                # importlib.resources reads a package's own data files through
+                # the loader; drop these and files() yields an orphan path.
+                # Not every loader has them -- FrozenImporter has neither.
+                resource_api = {}
+                try:
+                    resource_api['get_data'] = loader.get_data
+                except AttributeError:
+                    pass
+                try:
+                    resource_api['get_resource_reader'] = loader.get_resource_reader
+                except AttributeError:
+                    pass
+
+                spec.loader = SimpleNamespace(
+                    create_module=loader.create_module,
+                    exec_module=exec_module,
+                    **resource_api,
+                )
                 return spec
         raise ImportError(f"Could not load the module {fullname!r} to patch")
 
