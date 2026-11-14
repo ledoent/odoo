@@ -1,0 +1,43 @@
+{
+  "upstream_base": "b02bfedf6f879e4d3969e050c871d5fb90d05f24",
+  "python_3_12_unit_tests": {
+    "tests": 36,
+    "failed": 0,
+    "errors": 0
+  },
+  "python_3_12_odoo_suite": {
+    "reported_tests": 86,
+    "failed": 0,
+    "errors": 0,
+    "classes": [
+      "TestHttpSession",
+      "TestSessionStore",
+      "TestSessionRotation",
+      "TestFileSessionStore",
+      "TestMemorySessionStore",
+      "TestDevice"
+    ]
+  },
+  "native_http_replay_python_3_15": {
+    "mode": "filesystem",
+    "native_counter_http": 200,
+    "logout_http": 303,
+    "access_immediately_after_logout": 303,
+    "late_response_sets_original_cookie": false,
+    "access_after_late_response": 303,
+    "authenticated_access_restored": false,
+    "before_redirect": "/web/login?redirect=%2Fmy%2Fhome%3F",
+    "after_redirect": "/web/login?redirect=%2Fmy%2Fhome%3F",
+    "forced_save_delay_ms": 71.5
+  },
+  "redis_legacy_compatibility": {
+    "upstream_redis_20_0": "3eaa845",
+    "legacy_backend_rejected": true,
+    "reason": "Session backends must implement storage hooks instead of overriding save"
+  },
+  "limitations": [
+    "Redis adapter migration required before deployment",
+    "Windows, shared-filesystem and production performance not validated",
+    "Controlled HTTP interleaving; production incidence not measured"
+  ]
+}

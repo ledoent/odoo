@@ -2548,7 +2548,7 @@ class Response(requests.Response):
            entire session and ``session.is_new`` is ``False``.
         2. The session exists but was not persisted on disk (because it
            only contained default values), you get an *empty* session
-           but ``session.is_new`` is ``False``. This session is **not**
+           but ``session.is_new`` is ``True``. This session is **not**
            populated with :func:`odoo.http.session.get_default_session`
            as the ``db`` and ``context['lang']`` cannot be set. Please
            adapt your test in this regard.
@@ -2774,7 +2774,7 @@ class HttpCase(TransactionCase):
 
     def logout(self, keep_db=True):
         logout(self.session, keep_db=keep_db)
-        session_store().save(self.session)
+        session_store().rotate(self.session, self.env)
 
     def update_session(self, **items):
         self.session.update(**items)
