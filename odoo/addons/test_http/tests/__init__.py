@@ -12,6 +12,7 @@ from . import test_models
 from . import test_rpc_path
 from . import test_security
 from . import test_session
+from . import test_session_store
 from . import test_static
 from . import test_web_server
 from . import test_webjson

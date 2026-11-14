@@ -1,0 +1,51 @@
+name: Core session review
+
+on:
+  pull_request:
+    paths:
+      - odoo/http/session.py
+      - odoo/addons/test_http/**
+      - odoo/tests/common.py
+      - .github/workflows/core-session-review.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  session-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/oca/oca-ci/py3.12-odoo20.0@sha256:778e8dd08a7b30fb0ce2633859c73d96ac9ac3ecee31d4c0b3a4e389f012cc92
+      options: --user root
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /odoo/http/session.py
+            /odoo/addons/test_http/utils.py
+            /odoo/addons/test_http/tests/test_session_store.py
+      - name: Install review sources in the Odoo test image
+        run: |
+          python - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+          workspace = Path(os.environ['GITHUB_WORKSPACE'])
+          for filename in (
+              'odoo/http/session.py',
+              'odoo/addons/test_http/utils.py',
+              'odoo/addons/test_http/tests/test_session_store.py',
+          ):
+              shutil.copy2(workspace / filename, Path('/opt/odoo') / filename)
+          PY
+      - name: Test session creation, rotation and revocation
+        run: |
+          python - <<'PY'
+          import odoo.addons
+          import unittest
+          odoo.addons.__path__.append('/opt/odoo/addons')
+          unittest.main(module='odoo.addons.test_http.tests.test_session_store', verbosity=2)
+          PY

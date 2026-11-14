@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import functools
 import glob
 import ipaddress
@@ -18,6 +19,11 @@ from contextlib import suppress
 from datetime import datetime
 from http import HTTPStatus
 from zlib import adler32
+
+if os.name == 'nt':
+    import msvcrt
+else:
+    import fcntl
 
 from odoo.api import Environment
 from odoo.tools import config, consteq, get_lang
@@ -456,7 +462,13 @@ def check(session: Session, request_or_env: Request | Environment) -> None:
 
 
 class SessionStore:
-    """ Odoo implementation of the filesystem session store. """
+    """Session lifecycle with filesystem storage.
+
+    Other backends implement ``_lock``, ``_exists``, ``_save`` and
+    ``_delete_from_identifier`` together with their read/expiry operations.
+    The lock must serialize updates, rotation and revocation for one family
+    across workers. Cleanup must preserve the current SID, unlike revocation.
+    """
 
     def __init__(self, /, path: str | None = None, session_cls: type[Session] = Session):
         """
@@ -465,6 +477,9 @@ class SessionStore:
         :param session_cls: The session class to use.
             Defaults to :class:`Session`.
         """
+        for method in ('save', 'delete', 'rotate', 'delete_from_identifiers', 'delete_old_sessions'):
+            if getattr(type(self), method) is not getattr(__class__, method):
+                raise TypeError(f'Session backends must implement storage hooks instead of overriding {method}')
         if path is None:
             path = os.path.join(tempfile.gettempdir(), 'odoo_session_store')
             os.makedirs(path, exist_ok=True)
@@ -496,31 +511,111 @@ class SessionStore:
             raise ValueError(f'Invalid session id {sid!r}')
         return os.path.join(self.path, sid[:2], sid)
 
-    def save(self, session: Session) -> None:
-        """ Save a session. """
+    @contextlib.contextmanager
+    def _lock(self, identifier: str):
+        """Bounded lock shards; lock files must not be unlinked while in use."""
+        if not _session_identifier_re.fullmatch(identifier):
+            raise ValueError(f'Invalid session identifier {identifier!r}')
+        lock_dir = os.path.join(self.path, '.locks')
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(os.path.join(lock_dir, identifier[:2]), 'a+b') as lock:
+            if os.name == 'nt':
+                lock.seek(0)
+
+                def acquire():
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+
+                def release():
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                def acquire():
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                def release():
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+            while True:
+                try:
+                    acquire()
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    time.sleep(0.01)  # cooperative when running under gevent
+            try:
+                yield
+            finally:
+                release()
+
+    def _exists(self, sid: str) -> bool:
+        return os.path.isfile(self.get_session_path(sid))
+
+    @contextlib.contextmanager
+    def _write(self, session: Session):
+        try:
+            with self._lock(session.sid[:STORED_SESSION_BYTES]):
+                yield
+        except Exception:
+            # Rotation may already have changed the in-memory SID. An error
+            # handler must not retry it as an independent authenticated create.
+            session.can_save = False
+            raise
+
+    def save(self, session: Session) -> bool:
+        """Save a new/existing session; never recreate a deleted loaded session."""
+        if not session.can_save or session.should_rotate:
+            return False
+        with self._write(session):
+            if not session.is_new:
+                if not self._exists(session.sid):
+                    return False
+                recent = self.get(session.sid)
+                if 'next_sid' in recent:
+                    return self._follow_rotation(session, recent)
+            self._save(session)
+            session.is_new = False
+            return True
+
+    def _follow_rotation(self, session: Session, recent: Session) -> bool:
+        """Adopt the successor without overwriting stored rotation metadata."""
+        identifier = session.sid[:STORED_SESSION_BYTES]
+        visited = {recent.sid}
+        while 'next_sid' in recent:
+            sid = recent['next_sid']
+            if sid in visited or sid[:STORED_SESSION_BYTES] != identifier or not self._exists(sid):
+                return False
+            visited.add(sid)
+            recent = self.get(sid)
+        session.clear()
+        session.update(recent)
+        session.sid = recent.sid
+        session.is_new = False
+        session.should_rotate = False
+        return True
+
+    def _save(self, session: Session) -> None:
+        """Publish session data while holding its family lock."""
         # Perform an atomic save
         session_path = self.get_session_path(session.sid)
         # Create session in a transaction file in the
         # root directory of file session store
         fd, tmp = tempfile.mkstemp(suffix='.__tx_sess__', dir=self.path)
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(dict(session), f)
-        # Move the transaction file to the correct sub directory
-        with suppress(OSError):
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(dict(session), f)
             try:
                 os.replace(tmp, session_path)
             except FileNotFoundError:
-                # Ensure directory then retry
                 session_dir = os.path.dirname(session_path)
-                os.mkdir(session_dir, mode=0o755)
+                os.makedirs(session_dir, mode=0o755, exist_ok=True)
                 os.replace(tmp, session_path)
             os.chmod(session_path, 0o644)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(tmp)
 
     def delete(self, session: Session) -> None:
-        """ Delete a session. """
-        session_path = self.get_session_path(session.sid)
-        with suppress(OSError):
-            os.unlink(session_path)
+        """Revoke a session and all its soft-rotation predecessors/successors."""
+        self.delete_from_identifiers([session.sid[:STORED_SESSION_BYTES]])
 
     def get(self, sid: str, *, keep_sid: bool = False) -> Session:
         """
@@ -531,7 +626,8 @@ class SessionStore:
 
         It returns a new session (with a same or new sid depending on
         `keep_sid`) in case the sid is valid but that the session wasn't
-        found on disk.
+        found on disk. ``is_new`` describes persistence, including when
+        retaining a cookie SID whose session has never been saved.
         """
         if not self.is_valid_session_id(sid):
             return self.new()
@@ -550,11 +646,22 @@ class SessionStore:
         except OSError:
             if keep_sid:
                 _logger.debug("Could not load session from disk. Use empty session.", exc_info=True)
-                return self.session_cls({}, sid, new=False)
+                return self.session_cls({}, sid, new=True)
             _logger.debug("Could not load session from disk. Use new session.", exc_info=True)
             return self.new()
 
-    def rotate(self, session: Session, env: Environment, *, soft: bool = False) -> None:
+    def rotate(self, session: Session, env: Environment, *, soft: bool = False) -> bool:
+        if not session.can_save:
+            return False
+        with self._write(session):
+            if not session.is_new and not self._exists(session.sid) and (soft or session.uid):
+                return False
+            saved = self._rotate(session, env, soft=soft)
+            if saved:
+                session.is_new = False
+            return saved
+
+    def _rotate(self, session: Session, env: Environment, *, soft: bool = False) -> bool:
         """
         Rotate the session sid.
 
@@ -573,39 +680,42 @@ class SessionStore:
             if 'next_sid' in recent_session:
                 # A new session has already been saved on disk by a concurrent request,
                 # the save_session is going to simply use session.sid to set a new cookie.
-                session.sid = recent_session['next_sid']
-                return
+                return self._follow_rotation(session, recent_session)
             next_sid = static + self.generate_key()[STORED_SESSION_BYTES:]
             session['next_sid'] = next_sid
             session['deletion_time'] = time.time() + SESSION_DELETION_TIMER
-            self.save(session)
+            self._save(session)
             # Now prepare the new session
             session['gc_previous_sessions'] = True
             session.sid = next_sid
             del session['deletion_time']
             del session['next_sid']
         else:
-            self.delete(session)
+            self._delete_from_identifier(session.sid[:STORED_SESSION_BYTES])
             session.sid = self.generate_key()
             if req_ident := getattr(threading.current_thread(), 'req_ident', False):
                 _logger.info(
-                    'Session rotated: %s -> %s', req_ident[1], session.sid[:8]
+                    'Session rotated: %s -> %s', req_ident[1], session.sid[:8],
                 )
         if session.uid:
             assert env, "saving this session requires an environment"
             update_session_token(session, env)
         session.should_rotate = False
         session['create_time'] = time.time()
-        self.save(session)
+        session.is_new = True
+        self._save(session)
+        return True
 
     def vacuum(self, max_lifetime=SESSION_LIFETIME):
         """ Remove expired session files older than the given lifetime. """
         threshold = time.time() - max_lifetime
         for fname in glob.iglob(os.path.join(self.path, '*', '*')):
             path = os.path.join(self.path, fname)
-            with suppress(OSError):
-                if os.path.getmtime(path) < threshold:
-                    os.unlink(path)
+            identifier = os.path.basename(path)[:STORED_SESSION_BYTES]
+            if _session_identifier_re.fullmatch(identifier):
+                with self._lock(identifier), suppress(OSError):
+                    if os.path.getmtime(path) < threshold:
+                        os.unlink(path)
 
     def get_missing_session_identifiers(self, identifiers: Iterable[str]) -> set[str]:
         """
@@ -630,28 +740,35 @@ class SessionStore:
         return identifiers
 
     def delete_from_identifiers(self, identifiers: Iterable[str]) -> None:
-        """ Delete session files matching identifiers within the session store. """
-        files_to_unlink = []
+        """Revoke session families, serialized against their writes/rotations."""
         for identifier in identifiers:
             # Avoid to remove a session if it does not match an identifier.
             # This prevent malicious user to delete sessions from a different
             # database by specifying a custom ``res.device.log``.
             if not _session_identifier_re.match(identifier):
                 continue
-            normalized_path = os.path.normpath(os.path.join(self.path, identifier[:2], identifier + '*'))
-            if normalized_path.startswith(self.path):
-                files_to_unlink.extend(glob.glob(normalized_path))
-        for fn in files_to_unlink:
-            with suppress(OSError):
-                os.unlink(fn)
+            with self._lock(identifier):
+                self._delete_from_identifier(identifier)
+
+    def _delete_from_identifier(self, identifier: str, *, keep_sid: str | None = None) -> None:
+        """Delete a family under its lock, optionally retaining the active SID."""
+        pattern = os.path.join(self.path, identifier[:2], identifier + '*')
+        for path in glob.iglob(pattern):
+            if os.path.basename(path) != keep_sid:
+                with suppress(FileNotFoundError):
+                    os.unlink(path)
 
     def delete_old_sessions(self, session: Session) -> None:
         """ Delete old sessions based on expiration and cleanup flag value. """
         if 'gc_previous_sessions' in session:
-            if session['create_time'] + SESSION_DELETION_TIMER < time.time():
-                self.delete_from_identifiers([session.sid[:STORED_SESSION_BYTES]])
+            with self._write(session):
+                if session['create_time'] + SESSION_DELETION_TIMER >= time.time() or not self._exists(session.sid):
+                    return
+                if 'next_sid' in self.get(session.sid):
+                    return
+                self._delete_from_identifier(session.sid[:STORED_SESSION_BYTES], keep_sid=session.sid)
                 del session['gc_previous_sessions']
-                self.save(session)
+                self._save(session)
 
 
 @functools.cache
@@ -675,17 +792,26 @@ def save_session(request: Request, env: Environment | None = None) -> None:
     if not sess.can_save:
         return
 
+    saved = True
     if sess.should_rotate:
-        session_store().rotate(sess, env)  # it saves
+        saved = session_store().rotate(sess, env)  # it saves
     elif (
         sess.uid
         and time.time() >= sess['create_time'] + SESSION_ROTATION_INTERVAL
         and request.httprequest.path not in SESSION_ROTATION_EXCLUDED_PATHS
         and not request.httprequest.headers.get(SESSION_ROTATION_INTERVAL_HEADER_SKIP)
     ):
-        session_store().rotate(sess, env, soft=True)
+        saved = session_store().rotate(sess, env, soft=True)
     elif sess.is_dirty:
-        session_store().save(sess)
+        saved = session_store().save(sess)
+
+    if saved is False:
+        # A concurrent logout/revocation won. Never publish the stale SID again.
+        sess.clear()
+        sess.update(get_default_session())
+        sess.sid = session_store().generate_key()
+        sess.is_new = True
+        sess.should_rotate = False
 
     cookie_sid = request.cookies.get('session_id')
     if sess.is_dirty or cookie_sid != sess.sid:
